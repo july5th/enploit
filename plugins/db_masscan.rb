@@ -23,6 +23,8 @@ class Plugin::DB_Masscan < Msf::Plugin
   class ConsoleCommandDispatcher
     include Msf::Ui::Console::CommandDispatcher
 
+    attr_accessor :nmap, :queue, :end_str, :nmap_timeout
+
     #
     # The dispatcher's name.
     #
@@ -44,6 +46,11 @@ class Plugin::DB_Masscan < Msf::Plugin
     # This method handles the db_masscan command.
     #
     def cmd_db_masscan(*args)
+      self.queue = Queue.new
+      self.end_str = "END"
+      self.nmap_timeout = 120
+      max_nmap_thread_number = 32
+
       ::ActiveRecord::Base.connection_pool.with_connection {
         masscan = Rex::FileUtils.find_full_path("masscan")
         if (not masscan)
@@ -70,8 +77,8 @@ class Plugin::DB_Masscan < Msf::Plugin
           end
         end
          
-        @nmap = Rex::FileUtils.find_full_path("nmap")
-        if (nmap_version and not @nmap)
+        self.nmap = Rex::FileUtils.find_full_path("nmap")
+        if (nmap_version and not self.nmap)
           print_error("The nmap executable could not be found, so do not use --nmap-version.")
           return
         end
@@ -80,6 +87,11 @@ class Plugin::DB_Masscan < Msf::Plugin
           masscan_pipe = ::Open3::popen3(masscan, *arguments)
           temp_masscan_threads = []
           temp_nmap_threads = []
+          1.upto(max_nmap_thread_number) do |i|
+            temp_nmap_threads << framework.threads.spawn("masscan-nmap-#{i}", false) do 
+              nmap_scan_thread 
+            end
+          end
           temp_masscan_threads << framework.threads.spawn("db_masscan-Stdout", false, masscan_pipe[1]) do |np_1|
             np_1.each_line do |masscan_out|
               next if masscan_out.strip.empty?
@@ -90,10 +102,7 @@ class Plugin::DB_Masscan < Msf::Plugin
                 prot = $2
                 ip = $3
                 if nmap_version
-                  print_status("Masscan: start nmap for #{ip} #{port}/#{prot}")
-                  temp_nmap_threads << framework.threads.spawn("db_masscan-nmap-#{ip}-#{prot}-#{port}", false) do 
-                    mnmap_scan ip, port, prot
-                  end
+                  self.queue.push([ip, port, prot])
                 else
                   print_status("Masscan: import #{ip} #{port}/#{prot}")
                 end
@@ -110,6 +119,9 @@ class Plugin::DB_Masscan < Msf::Plugin
 
           temp_masscan_threads.map {|t| t.join rescue nil}
           masscan_pipe.each {|p| p.close rescue nil}
+          1.upto(max_nmap_thread_number * 2) do |i|
+            self.queue.push self.end_str
+          end
           temp_nmap_threads.map {|t| t.join rescue nil}
         rescue ::IOError
         end
@@ -140,41 +152,40 @@ class Plugin::DB_Masscan < Msf::Plugin
       end
     end
 
-    def mnmap_scan ip, port, prot
-      fd = Rex::Quickfile.new(["plugin-db-masscan-nmap-#{ip}-#{prot}-#{port}-", '.xml'], Msf::Config.local_directory)
-      begin 
-        arguments = ['-P0', '--open']
-        case prot
-        when 'tcp'
-          arguments.push '-sV'
-        when 'udp'
-          arguments.push '-sUV'
-        end
-        arguments.push "-p#{port}"
-        arguments.push ip
-        arguments.push('-oX', fd.path)
-
-        begin
-          nmap_pipe = ::Open3::popen3([@nmap, ''], *arguments)
-          temp_nmap_threads = []
-          temp_nmap_threads << framework.threads.spawn("db_nmap-Stdout-#{ip}-#{prot}-#{port}", false, nmap_pipe[1]) do |np_1|
-            np_1.each_line do |nmap_out|
-              next if nmap_out.strip.empty?
-              print_status("Nmap: #{nmap_out.strip}") if nmap_out.strip =~ /open/
-            end
+    def nmap_scan_thread
+      while (task = self.queue.pop)
+        return nil if task == self.end_str
+        ip = task[0]
+        port = task[1].to_i
+        prot = task[2]
+        fd = Rex::Quickfile.new(["plugin-db-masscan-nmap-#{ip}-#{prot}-#{port}-", '.xml'], Msf::Config.local_directory)
+        begin 
+          arguments = ['-P0', '--open']
+          case prot
+          when 'tcp'
+            arguments.push '-sV'
+          when 'udp'
+            arguments.push '-sUV'
           end
-        rescue ::IOError
+          arguments.push "-p#{port}"
+          arguments.push ip
+          arguments.push('-oX', fd.path)
+          arguments.push('--host-timeout', self.nmap_timeout)
+          
+          print_status("Masscan: start nmap for #{ip} #{port}/#{prot}")
+
+          command = "#{self.nmap} #{arguments.join(' ')}"
+          output = `#{command}`
+          output.each_line do |x|
+            print_status("Nmap: #{x.strip}") if x.strip =~ /open/
+          end
+
+          framework.db.import_nmap_xml_file(:filename => fd.path)
+          print_status("Saved XML results #{fd.path}") 
+        ensure
+          fd.close
+          fd.unlink 
         end
-
-        temp_nmap_threads.map {|t| t.join rescue nil}
-        nmap_pipe.each {|p| p.close rescue nil}
-
-        framework.db.import_nmap_xml_file(:filename => fd.path)
-        print_status("Saved XML results #{fd.path}") 
-
-      ensure
-        fd.close
-        fd.unlink 
       end
     end
 

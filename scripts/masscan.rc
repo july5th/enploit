@@ -14,7 +14,7 @@ File.open(target_file).each_line do |ip|
   if ip_list.size >= 3
     target = ip_list.join(' ')
     print_line("start db_masscan for #{target}")
-    command = "db_masscan -p#{ports.join(',')} #{target} --nmap-version"
+    command = "db_masscan -p#{ports.join(',')} #{target} --nmap-version --rate 10000"
     run_single(command)
     ip_list = []
   end
